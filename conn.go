@@ -215,6 +215,9 @@ func (c *Conn)parser(buf []byte){
 			if rv, err = pa.Ask(); err != nil {
 				return
 			}
+			if rv == nil {
+				rv = OkPkt
+			}
 			if err = c.send(rv, id, RecvAsk); err != nil {
 				return
 			}
@@ -247,9 +250,8 @@ func (c *Conn)Serve()(err error){
 		panic("Conn already served")
 	}
 	c.started = true
-	var (
-		buf []byte
-	)
+	var buf []byte
+	defer c.cancel()
 	for {
 		if buf, err = c.r.ReadBytes(); err != nil {
 			break
@@ -259,6 +261,5 @@ func (c *Conn)Serve()(err error){
 	if err != nil {
 		c.err = err
 	}
-	c.cancel()
 	return
 }
