@@ -85,6 +85,10 @@ func (c *Conn)Close()(err error){
 	return
 }
 
+func (c *Conn)Context()(context.Context){
+	return c.ctx
+}
+
 func (c *Conn)Err()(error){
 	return c.err
 }
@@ -114,10 +118,14 @@ func (c *Conn)NewPacket(pid uint32)(PacketBase){
 }
 
 func (c *Conn)Ping()(ping time.Duration, err error){
+	return c.PingWith(context.Background())
+}
+
+func (c *Conn)PingWith(ctx context.Context)(ping time.Duration, err error){
 	begin := time.Now()
 	pay := (uint64)(begin.Unix() * 1000 + begin.UnixNano() / 1000000 % 1000)
 	var res PacketBase
-	if res, err = c.Ask(&Ping{pay}); err != nil {
+	if res, err = c.AskWith(ctx, &Ping{pay}); err != nil {
 		return
 	}
 	if pay != res.(*Pong).Payload {
@@ -133,6 +141,10 @@ func (c *Conn)Send(p PacketBase)(err error){
 }
 
 func (c *Conn)Ask(p PacketBase)(res PacketBase, err error){
+	return c.AskWith(context.Background(), p)
+}
+
+func (c *Conn)AskWith(ctx context.Context, p PacketBase)(res PacketBase, err error){
 	ch := make(chan PacketBase, 1)
 	c.idmux.Lock()
 	c.idins++
@@ -152,6 +164,9 @@ func (c *Conn)Ask(p PacketBase)(res PacketBase, err error){
 	}
 	select {
 	case res = <- ch:
+		return
+	case <-ctx.Done():
+		err = ctx.Err()
 		return
 	case <-c.ctx.Done():
 		err = c.ctx.Err()
