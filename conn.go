@@ -20,12 +20,22 @@ const (
 	RecvAsk byte = 0x02
 )
 
+type ConnState int
+const (
+	ConnInited ConnState = iota
+	ConnServing
+	ConnPreStream
+	ConnStreamed
+)
+
 type Conn struct{
 	r encoding.Reader
 	w encoding.Writer
 
-	started bool
-	err error
+	status ConnState
+	statusmux sync.RWMutex
+	served chan struct{}
+	streamed chan struct{}
 	ctx context.Context
 	cancel context.CancelFunc
 
@@ -35,6 +45,9 @@ type Conn struct{
 	waits map[uint32]chan PacketBase
 
 	pkts map[uint32]PacketNewer
+
+	OnPktNotFound func(id uint32, body encoding.Reader)
+	OnParseError func(pkt PacketBase, err error)
 }
 
 func NewConn(r io.Reader, w io.Writer)(c *Conn){
@@ -46,7 +59,9 @@ func NewConnContext(ctx context.Context, r io.Reader, w io.Writer)(c *Conn){
 	c = &Conn{
 		r: encoding.WrapReader(r),
 		w: encoding.WrapWriter(w),
-		started: false,
+		status: ConnInited,
+		served: make(chan struct{}, 0),
+		streamed: make(chan struct{}, 0),
 		ctx: ctx,
 		cancel: cancel,
 		waits: make(map[uint32]chan PacketBase),
@@ -89,13 +104,16 @@ func (c *Conn)Context()(context.Context){
 	return c.ctx
 }
 
-func (c *Conn)Err()(error){
-	return c.err
+func (c *Conn)ServeDone()(<-chan struct{}){
+	return c.served
 }
 
 func (c *Conn)initPkts(){
 	c.AddPacket(func()(PacketBase){ return new(Ping) })
 	c.AddPacket(func()(PacketBase){ return new(Pong) })
+	c.AddPacket(func()(PacketBase){ return OkPkt })
+	c.AddPacket(func()(PacketBase){ return stmPing })
+	c.AddPacket(func()(PacketBase){ return stmPong })
 }
 
 func (c *Conn)AddPacket(newer PacketNewer){
@@ -115,6 +133,15 @@ func (c *Conn)NewPacket(pid uint32)(PacketBase){
 		return newer()
 	}
 	return nil
+}
+
+func (c *Conn)checkStreamed(){
+	c.statusmux.RLock()
+	if c.status > ConnServing {
+		c.statusmux.RUnlock()
+		panic("pio.Conn is streamed")
+	}
+	c.statusmux.RUnlock()
 }
 
 func (c *Conn)Ping()(ping time.Duration, err error){
@@ -137,6 +164,7 @@ func (c *Conn)PingWith(ctx context.Context)(ping time.Duration, err error){
 }
 
 func (c *Conn)Send(p PacketBase)(err error){
+	c.checkStreamed()
 	return c.send(p, 0, NoAsk)
 }
 
@@ -145,6 +173,8 @@ func (c *Conn)Ask(p PacketBase)(res PacketBase, err error){
 }
 
 func (c *Conn)AskWith(ctx context.Context, p PacketBase)(res PacketBase, err error){
+	c.checkStreamed()
+
 	ch := make(chan PacketBase, 1)
 	c.idmux.Lock()
 	c.idins++
@@ -196,13 +226,12 @@ func (c *Conn)send(p PacketBase, id uint32, ask byte)(err error){
 	return
 }
 
-func (c *Conn)parser(buf []byte){
+func (c *Conn)parser(buf []byte)(err error){
 	var (
 		id uint32
 		ask byte
 		pid uint32
 		p PacketBase
-		err error
 	)
 
 	rd := encoding.WrapReader(bytes.NewReader(buf))
@@ -217,25 +246,30 @@ func (c *Conn)parser(buf []byte){
 	}
 	p = c.NewPacket(pid)
 	if p == nil {
+		if c.OnPktNotFound != nil {
+			c.OnPktNotFound(pid, rd)
+		}
 		return
 	}
 	err = p.ParseFrom(rd)
 	if err != nil {
+		if c.OnParseError != nil {
+			c.OnParseError(p, err)
+		}
 		return
 	}
 	switch ask {
 	case SendAsk:
-		if pa, ok := p.(PacketAsk); ok {
-			var rv PacketBase
-			if rv, err = pa.Ask(); err != nil {
-				return
-			}
-			if rv == nil {
-				rv = OkPkt
-			}
-			if err = c.send(rv, id, RecvAsk); err != nil {
-				return
-			}
+		pa := p.(PacketAsk)
+		var rv PacketBase
+		if rv, err = pa.Ask(); err != nil {
+			return
+		}
+		if rv == nil {
+			rv = OkPkt
+		}
+		if err = c.send(rv, id, RecvAsk); err != nil {
+			return
 		}
 	case RecvAsk:
 		c.idmux.Lock()
@@ -247,34 +281,111 @@ func (c *Conn)parser(buf []byte){
 		if ok {
 			ch <- p
 		}
-		return
 	case NoAsk:
+		if p == stmPing {
+			if err = c.send(stmPong, 0, NoAsk); err != nil {
+				return
+			}
+			return streamingErr
+		}
+		if p == stmPong {
+			return streamingErr
+		}
 		if pa, ok := p.(Packet); ok {
 			if err = pa.Trigger(); err != nil {
 				return
 			}
 		}
 	default:
-		panic("Unknown ask value")
-		return
+		panic("Unexpected ask mask")
 	}
+	return
 }
 
 func (c *Conn)Serve()(err error){
-	if c.started {
-		panic("Conn already served")
+	c.statusmux.Lock()
+	if c.status != ConnInited {
+		c.statusmux.Unlock()
+		panic("pio.Conn already served")
 	}
-	c.started = true
+	c.status = ConnServing
+	c.statusmux.Unlock()
+	close(c.served)
+
 	var buf []byte
 	defer c.cancel()
 	for {
-		if buf, err = c.r.ReadBytes(); err != nil {
-			break
+		{
+			c.statusmux.RLock()
+			st := c.status
+			c.statusmux.RUnlock()
+			if st != ConnServing && st != ConnPreStream {
+				break
+			}
 		}
-		c.parser(buf)
+		if buf, err = c.r.ReadBytes(); err != nil {
+			return
+		}
+		if er := c.parser(buf); er != nil {
+			if er == streamingErr {
+				c.statusmux.Lock()
+				c.status = ConnStreamed
+				c.statusmux.Unlock()
+				close(c.streamed)
+				return
+			}
+		}
 	}
-	if err != nil {
-		c.err = err
+	return
+}
+
+type readWriteCloser struct{
+	c *Conn
+}
+
+var _ io.ReadWriteCloser = readWriteCloser{}
+
+func (c readWriteCloser)Read(buf []byte)(n int, err error){
+	return c.c.r.Read(buf)
+}
+
+func (c readWriteCloser)Write(buf []byte)(n int, err error){
+	return c.c.w.Write(buf)
+}
+
+func (c readWriteCloser)Close()(err error){
+	return c.c.Close()
+}
+
+func (c *Conn)StreamedDone()(<-chan struct{}){
+	return c.streamed
+}
+
+func (c *Conn)AsStream()(rw io.ReadWriteCloser, err error){
+	c.statusmux.Lock()
+	streaming := c.status != ConnStreamed
+	if streaming {
+		if c.status != ConnServing {
+			c.statusmux.Unlock()
+			panic("pio.Conn is not serving")
+		}
+		c.status = ConnPreStream
+		if err = c.send(stmPing, 0, NoAsk); err != nil {
+			c.status = ConnServing
+			c.statusmux.Unlock()
+			return
+		}
 	}
+	c.statusmux.Unlock()
+
+	if streaming {
+		select{
+		case <-c.streamed:
+		case <-c.ctx.Done():
+			err = c.ctx.Err()
+			return
+		}
+	}
+	rw = readWriteCloser{c}
 	return
 }
