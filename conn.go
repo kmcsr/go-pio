@@ -92,6 +92,7 @@ func OsPipe()(c *Conn, br, bw *os.File, err error){
 }
 
 func (c *Conn)Close()(err error){
+	c.cancel()
 	err = c.r.Close()
 	err2 := c.w.Close()
 	if err == nil {
@@ -126,6 +127,13 @@ func (c *Conn)AddPacket(newer PacketNewer){
 		panic("Packet id already exists")
 	}
 	c.pkts[pid] = newer
+}
+
+func (c *Conn)PopPacket(pid uint32)(ok bool){
+	if _, ok = c.pkts[pid]; ok {
+		delete(c.pkts, pid)
+	}
+	return
 }
 
 func (c *Conn)NewPacket(pid uint32)(PacketBase){
@@ -189,9 +197,11 @@ func (c *Conn)AskWith(ctx context.Context, p PacketBase)(res PacketBase, err err
 	c.waits[id] = ch
 	defer delete(c.waits, id)
 	c.idmux.Unlock()
+
 	if err = c.send(p, id, SendAsk); err != nil {
 		return
 	}
+
 	select {
 	case res = <- ch:
 		return
@@ -379,7 +389,7 @@ func (c *Conn)AsStream()(rw io.ReadWriteCloser, err error){
 	c.statusmux.Unlock()
 
 	if streaming {
-		select{
+		select {
 		case <-c.streamed:
 		case <-c.ctx.Done():
 			err = c.ctx.Err()
